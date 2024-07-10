@@ -555,6 +555,270 @@ func validateGuestID(id string) types.BaseMethodFault {
 	return &types.InvalidArgument{InvalidProperty: "configSpec.guestId"}
 }
 
+/*
+ * getDeviceGroupChanges finds changes in device groups and populates removed and added device groups.
+ *
+ * param: deviceGroups	  [in] new list of device groups
+ * param: oldDeviceGroups [in] existing list of device groups
+ * param: removed         [out] device groups being removed
+ * param: added           [out] device groups being added
+ */
+func getDeviceGroupChanges(
+	deviceGroups, oldDeviceGroups *types.VirtualMachineVirtualDeviceGroups,
+	removed map[int32]bool, added map[int32]int32) types.BaseMethodFault {
+	// No changes in groups list if deviceGroups are not updated.
+	if deviceGroups == nil {
+		return nil
+	}
+
+	/*
+	 * Pre-populate removed array with all groups currently present:
+	 * if group is not listed in new array, it is marked removed.
+	 */
+	knownGroups := make(map[int32]string)
+	if oldDeviceGroups != nil {
+		deviceGroupArray := oldDeviceGroups.DeviceGroup
+		for _, dg := range deviceGroupArray {
+			groupInstanceKey := dg.GetVirtualMachineVirtualDeviceGroupsDeviceGroup().GroupInstanceKey
+			removed[groupInstanceKey] = true
+
+			vendorDeviceGroup := dg.(*types.VirtualMachineVirtualDeviceGroupsVendorDeviceGroup)
+			knownGroups[groupInstanceKey] = ""
+			if vendorDeviceGroup != nil {
+				knownGroups[groupInstanceKey] = vendorDeviceGroup.DeviceGroupName
+			}
+		}
+	}
+
+	/*
+	 * Request has an empty/nil device group array. That means
+	 * everything is removed ( no change to group list is indicated by not modifying
+	 * VirtualDeviceGroups at all, as VMODL cannot distinguish between empty array and no array at all).
+	 */
+	deviceGroupArray := deviceGroups.DeviceGroup
+	if len(deviceGroupArray) == 0 {
+		return nil
+	}
+
+	seen := make(map[int32]bool)
+	index := 0
+	const MaxDeviceGroupDevices = 4
+
+	for _, dg := range deviceGroupArray {
+		groupInstanceKey := dg.GetVirtualMachineVirtualDeviceGroupsDeviceGroup().GroupInstanceKey
+
+		if _, ok := seen[groupInstanceKey]; ok {
+			return Fault("Device group with specified key already exists",
+				&types.InvalidVmConfig{Property: fmt.Sprintf("configSpec.deviceGroups.deviceGroup[%d]", index)}).VimFault().(types.BaseMethodFault)
+		}
+
+		vendorDeviceGroup, isVendorDeviceGroup := dg.(*types.VirtualMachineVirtualDeviceGroupsVendorDeviceGroup)
+
+		/* Modifying an existing device? */
+		if oldDeviceGroupName, ok := knownGroups[groupInstanceKey]; ok {
+			if oldDeviceGroupName == "" {
+				/*
+				 * If group is present as non-vendor group, we allow update with
+				 * non-vendor device group so in VM with broken config we can
+				 * add/delete unrelated groups.  But one cannot "upgrade"
+				 * non-vendor group to vendor group.
+				 */
+				if isVendorDeviceGroup {
+					return Fault("Device group type does not match",
+						&types.InvalidVmConfig{Property: fmt.Sprintf("configSpec.deviceGroups.deviceGroup[%d]", index)}).VimFault().(types.BaseMethodFault)
+				}
+
+			} else if !isVendorDeviceGroup {
+				return Fault("Device group type does not match",
+					&types.InvalidVmConfig{Property: fmt.Sprintf("configSpec.deviceGroups.deviceGroup[%d]", index)}).VimFault().(types.BaseMethodFault)
+			} else if vendorDeviceGroup.DeviceGroupName != oldDeviceGroupName {
+				return Fault("Device group name cannot be changed",
+					&types.InvalidVmConfig{Property: fmt.Sprintf("configSpec.deviceGroups.deviceGroup[%d]", index)}).VimFault().(types.BaseMethodFault)
+			}
+
+			delete(removed, groupInstanceKey)
+
+		} else if !isVendorDeviceGroup {
+			return Fault("Requested device group type is not supported",
+				&types.InvalidVmConfig{Property: fmt.Sprintf("configSpec.deviceGroups.deviceGroup[%d]", index)}).VimFault().(types.BaseMethodFault)
+		} else {
+			/* It is new group ID, never seen before. */
+			added[groupInstanceKey] = int32(index)
+		}
+
+		index++
+	}
+
+	if index > MaxDeviceGroupDevices {
+		return Fault("Too many virtual device groups", &types.TooManyDevices{InvalidVmConfig: types.InvalidVmConfig{Property: "configSpec.deviceGroups.deviceGroup"}}).VimFault().(types.BaseMethodFault)
+	}
+
+	return nil
+}
+
+func isSupportedDeviceGroupDevice(dev types.BaseVirtualDevice) bool {
+	switch dev.(type) {
+	case *types.VirtualPCIPassthrough, *types.VirtualSriovEthernetCard:
+		return true
+	default:
+		return false
+	}
+}
+
+/*
+ * getDeviceGroupAssignment finds change in device groups.
+ *
+ * param: removed               [in] device groups being removed
+ * param: added                 [in] device groups being added
+ * param: deviceChanges         [out] device groups being removed
+ * param: deviceGroupAssignment	[out] device groups being added
+ */
+func getDeviceGroupAssignment(
+	removed map[int32]bool,
+	added map[int32]int32,
+	deviceChanges []types.BaseVirtualDeviceConfigSpec,
+	oldDevices []types.BaseVirtualDevice,
+	deviceGroupAssignment map[int32]*types.VirtualDeviceDeviceGroupInfo) types.BaseMethodFault {
+
+	// populate pre-existing device group device assignments
+	for _, dev := range oldDevices {
+		virtualDevice := dev.GetVirtualDevice()
+		deviceGroupAssignment[virtualDevice.Key] = virtualDevice.DeviceGroupInfo
+	}
+
+	//
+	for i, deviceChange := range deviceChanges {
+		devSpec := deviceChange.GetVirtualDeviceConfigSpec()
+		baseDevice := devSpec.Device
+		device := devSpec.Device.GetVirtualDevice()
+		deviceGroupInfo := device.DeviceGroupInfo
+		devKey := device.Key
+
+		var oldDeviceGroupInfo *types.VirtualDeviceDeviceGroupInfo
+		if devKey >= 0 {
+			oldDeviceGroupInfo, _ = deviceGroupAssignment[devKey]
+		}
+
+		op := devSpec.Operation
+
+		switch op {
+		case types.VirtualDeviceConfigSpecOperationRemove:
+			/*
+			 * Do not care about group info.  Device is being removed, so key is
+			 * only thing that matters.
+			 */
+			if oldDeviceGroupInfo != nil {
+				if _, ok := removed[oldDeviceGroupInfo.GroupInstanceKey]; !ok {
+					return Fault("Device can be removed together with its group only",
+						&types.InvalidDeviceSpec{
+							InvalidVmConfig: types.InvalidVmConfig{Property: "device.deviceGroupInfo.groupInstanceKey"},
+							DeviceIndex:     int32(i),
+						}).VimFault().(types.BaseMethodFault)
+				}
+
+				delete(deviceGroupAssignment, devKey)
+			}
+			break
+		case types.VirtualDeviceConfigSpecOperationAdd:
+			// Not part of the group
+			if deviceGroupInfo == nil {
+				break
+			}
+
+			if _, ok := added[deviceGroupInfo.GroupInstanceKey]; !ok {
+				return Fault("Device can be added to newly created group only.",
+					&types.InvalidDeviceSpec{
+						InvalidVmConfig: types.InvalidVmConfig{Property: "device.deviceGroupInfo.groupInstanceKey"},
+						DeviceIndex:     int32(i),
+					}).VimFault().(types.BaseMethodFault)
+			}
+
+			if !isSupportedDeviceGroupDevice(baseDevice) {
+				return Fault("Only PCI and SR-IOV devices can be part of device group.",
+					&types.InvalidDeviceSpec{
+						InvalidVmConfig: types.InvalidVmConfig{Property: "device"},
+						DeviceIndex:     int32(i),
+					}).VimFault().(types.BaseMethodFault)
+			}
+
+			deviceGroupAssignment[int32(-i-1)] = deviceGroupInfo
+			break
+		case types.VirtualDeviceConfigSpecOperationEdit:
+			// Not part of the group
+			if deviceGroupInfo == nil {
+				break
+			}
+
+			if oldDeviceGroupInfo != nil && (oldDeviceGroupInfo.GroupInstanceKey != deviceGroupInfo.GroupInstanceKey ||
+				oldDeviceGroupInfo.SequenceId != deviceGroupInfo.SequenceId) {
+				return Fault("Device's group settings cannot be modified.",
+					&types.InvalidDeviceSpec{
+						InvalidVmConfig: types.InvalidVmConfig{Property: "device.deviceGroupInfo"},
+						DeviceIndex:     int32(i),
+					}).VimFault().(types.BaseMethodFault)
+			}
+			break
+		default:
+			break
+		}
+	}
+
+	return nil
+}
+
+// validateDeviceGroups validates the device group changes for the virtual machine.
+func (vm *VirtualMachine) validateDeviceGroups(
+	deviceChanges []types.BaseVirtualDeviceConfigSpec,
+	deviceGroups *types.VirtualMachineVirtualDeviceGroups) types.BaseMethodFault {
+
+	if len(deviceChanges) == 0 && deviceGroups == nil {
+		return nil
+	}
+
+	removedDeviceGroups := make(map[int32]bool)
+	addedDeviceGroups := make(map[int32]int32)
+	if err := getDeviceGroupChanges(deviceGroups, vm.Config.DeviceGroups, removedDeviceGroups, addedDeviceGroups); err != nil {
+		return err
+	}
+
+	if len(addedDeviceGroups) != 0 {
+		hwVersion, _ := types.ParseHardwareVersion(vm.Config.Version)
+		if hwVersion < types.VMX20 {
+			return Fault(fmt.Sprintf("Vendor Device Groups are unsupported for the current virtual machine version"+
+				"%v. A minimum version of '%v' is required", hwVersion, types.VMX20),
+				&types.InvalidVmConfig{Property: "configSpec.deviceGroups"}).VimFault().(types.BaseMethodFault)
+		}
+	}
+
+	deviceGroupAssignment := make(map[int32]*types.VirtualDeviceDeviceGroupInfo)
+	if err := getDeviceGroupAssignment(removedDeviceGroups, addedDeviceGroups, deviceChanges, vm.Config.Hardware.Device, deviceGroupAssignment); err != nil {
+		return err
+	}
+
+	for _, deviceGroupInfo := range deviceGroupAssignment {
+		if deviceGroupInfo != nil {
+			groupInstanceId := deviceGroupInfo.GroupInstanceKey
+
+			if _, ok := removedDeviceGroups[groupInstanceId]; ok {
+				return Fault("Device group is in use",
+					&types.InvalidVmConfig{Property: "configSpec.deviceGroups"}).VimFault().(types.BaseMethodFault)
+			}
+
+			/* There is at least one device in this group,
+			 * so an addition of the group is allowed.
+			 */
+			delete(addedDeviceGroups, groupInstanceId)
+		}
+	}
+
+	for id, devIdx := range addedDeviceGroups {
+		return Fault(fmt.Sprintf("Device group %v with groupInstanceId %v contains no devices.", devIdx, id),
+			&types.InvalidVmConfig{Property: "configSpec.deviceGroups"}).VimFault().(types.BaseMethodFault)
+	}
+
+	return nil
+}
+
 func (vm *VirtualMachine) configure(ctx *Context, spec *types.VirtualMachineConfigSpec) (result types.BaseMethodFault) {
 	defer func() {
 		if result == nil {
@@ -590,6 +854,12 @@ func (vm *VirtualMachine) configure(ctx *Context, spec *types.VirtualMachineConf
 
 	if spec.VAppConfig != nil {
 		if err := vm.updateVAppProperty(spec.VAppConfig.GetVmConfigSpec()); err != nil {
+			return err
+		}
+	}
+
+	if spec.DeviceGroups != nil {
+		if err := vm.validateDeviceGroups(spec.DeviceChange, spec.DeviceGroups); err != nil {
 			return err
 		}
 	}
@@ -1594,6 +1864,80 @@ func (vm *VirtualMachine) genVmdkPath(p object.DatastorePath) (string, types.Bas
 	}
 }
 
+func (vm *VirtualMachine) configureDeviceGroups(ctx *Context, deviceGroups *types.VirtualMachineVirtualDeviceGroups) {
+	if deviceGroups == nil {
+		return
+	}
+
+	var removeChanges []types.PropertyChange
+	field := mo.Field{Path: "config.deviceGroups.deviceGroup"}
+
+	configDeviceGroups := vm.Config.DeviceGroups
+	// remove any existing device groups.
+	if configDeviceGroups != nil {
+		for _, baseDeviceGrp := range configDeviceGroups.DeviceGroup {
+			change := types.PropertyChange{}
+			dg := baseDeviceGrp.GetVirtualMachineVirtualDeviceGroupsDeviceGroup()
+
+			change.Op = types.PropertyChangeOpRemove
+			field.Key = dg.GroupInstanceKey
+			change.Name = field.String()
+			removeChanges = append(removeChanges, change)
+		}
+
+		// clear the deviceGroup array
+		configDeviceGroups.DeviceGroup = nil
+		change := types.PropertyChange{Name: field.Path, Val: nil}
+		removeChanges = append(removeChanges, change)
+	}
+
+	// remove existing
+	if len(removeChanges) != 0 {
+		// clear old deviceGroups
+		configDeviceGroups = nil
+		deviceGroupsField := mo.Field{Path: "config.deviceGroups"}
+		change := types.PropertyChange{Name: deviceGroupsField.Path, Val: nil}
+		ctx.Map.Update(vm, append(removeChanges, change))
+	}
+
+	var newChanges []types.PropertyChange
+	if len(deviceGroups.DeviceGroup) != 0 {
+		// find max positive groupInstanceKey if any.
+		maxKey := int32(0)
+		for _, baseDeviceGrp := range deviceGroups.DeviceGroup {
+			key := baseDeviceGrp.GetVirtualMachineVirtualDeviceGroupsDeviceGroup().GroupInstanceKey
+			maxKey = max(maxKey, key)
+		}
+
+		configDeviceGroups = &types.VirtualMachineVirtualDeviceGroups{}
+
+		// Add the desired deviceGroup array
+		for i := range deviceGroups.DeviceGroup {
+			change := types.PropertyChange{}
+			dg := deviceGroups.DeviceGroup[i].GetVirtualMachineVirtualDeviceGroupsDeviceGroup()
+			if dg.GroupInstanceKey < 0 {
+				dg.GroupInstanceKey = maxKey + 1
+				maxKey++
+			}
+
+			// add to vm config
+			configDeviceGroups.DeviceGroup = append(configDeviceGroups.DeviceGroup, deviceGroups.DeviceGroup[i])
+
+			change.Op = types.PropertyChangeOpAdd
+			change.Val = deviceGroups.DeviceGroup[i]
+			field.Key = dg.GroupInstanceKey
+			change.Name = field.String()
+			newChanges = append(newChanges, change)
+		}
+	}
+
+	if len(newChanges) != 0 {
+		deviceGroupsField := mo.Field{Path: "config.deviceGroups"}
+		change := types.PropertyChange{Name: deviceGroupsField.Path, Val: deviceGroups}
+		ctx.Map.Update(vm, append(newChanges, change))
+	}
+}
+
 func (vm *VirtualMachine) configureDevices(ctx *Context, spec *types.VirtualMachineConfigSpec) types.BaseMethodFault {
 	var changes []types.PropertyChange
 	field := mo.Field{Path: "config.hardware.device"}
@@ -1688,6 +2032,11 @@ func (vm *VirtualMachine) configureDevices(ctx *Context, spec *types.VirtualMach
 	if len(changes) != 0 {
 		change := types.PropertyChange{Name: field.Path, Val: []types.BaseVirtualDevice(devices)}
 		ctx.Map.Update(vm, append(changes, change))
+	}
+
+	err = vm.configureDeviceGroups(ctx, spec.DeviceGroups)
+	if err != nil {
+		return err
 	}
 
 	err = vm.updateDiskLayouts()
